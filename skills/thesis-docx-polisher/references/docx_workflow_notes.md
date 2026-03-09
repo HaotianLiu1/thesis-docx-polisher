@@ -4,6 +4,7 @@
 
 - Chapter range detection
 - Paragraph filtering policy
+- Batch processing semantics
 - Diff rendering semantics
 - Stability and retry behavior
 
@@ -26,6 +27,17 @@ The script skips paragraphs likely not body text based on `--skip-style-keys` (c
 
 It also skips very short text (`len < --min-len`).
 
+## Batch processing semantics
+
+- Candidate paragraphs are collected first, then split by `--paragraphs-per-call`.
+- Each batch is sent as `items=[{id,text}, ...]`.
+- Returned results are mapped by `id` to avoid ordering issues.
+- `--limit` is applied on candidate count before batching.
+
+Fallback behavior:
+- Whole batch fallback to original text on non-JSON response.
+- Per-item fallback on missing/invalid `id` or empty `revised_text`.
+
 ## Diff rendering semantics
 
 Paragraph-level old/new diff is produced with token alignment:
@@ -38,12 +50,15 @@ This gives a git-like visual comparison inside Word while keeping one final para
 
 ## Stability and retry behavior
 
-- Retry on exceptions and HTTP 5xx.
-- Exponential backoff: `retry_backoff * 2^attempt`.
-- `--fail-log` writes JSONL entries with paragraph index and error.
+- Retry on request exceptions, HTTP `429`, and HTTP `5xx`.
+- `Retry-After` header is honored when present.
+- Exponential backoff fallback: `retry_backoff * 2^attempt`.
+- `--sleep` throttles between batches.
+- `--fail-log` writes JSONL entries for API errors and fallback statuses.
 
-Example `--fail-log` line:
+Example `--fail-log` lines:
 
 ```json
-{"paragraph_index": 645, "error": "HTTPError: 502 Server Error"}
+{"paragraph_index": 645, "status": "api_error", "error": "HTTPError: 502 Server Error"}
+{"paragraph_index": 646, "status": "id_missing"}
 ```

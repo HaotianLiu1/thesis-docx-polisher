@@ -4,7 +4,9 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import requests
@@ -30,8 +32,11 @@ SYSTEM_PROMPT = """
 3) 避免机械连接，使用自然衔接；句式可适度变化（简单句/复合句/插入语混合），避免连续整齐短句。
 4) 保留术语、缩写、编号、公式、图表编号、引用编号。
 
+你会收到一个 JSON：{"items":[{"id":0,"text":"..."}, ...]}。
+请对每个 item 独立判断并返回同样 id 的结果。
+
 只输出 JSON：
-{"need_edit": true/false, "revised_text": "修改后段落"}
+{"items":[{"id":0,"need_edit":true/false,"revised_text":"修改后段落"}, ...]}
 不要输出任何额外说明。
 """.strip()
 
@@ -48,6 +53,7 @@ class ApiClient:
         self.timeout = timeout
         self.retries = retries
         self.retry_backoff = retry_backoff
+        self.http_calls = 0
         self.headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -188,44 +194,162 @@ def chapter_range(doc: Document, start_chapter: int, end_chapter: int, chapter_s
     return start, end, h1, ref
 
 
-def call_openai_compatible(session, client: ApiClient, paragraph_text: str):
+def parse_retry_after(header_value: str):
+    if not header_value:
+        return None
+    value = header_value.strip()
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except Exception:
+        pass
+    try:
+        dt = parsedate_to_datetime(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        wait = (dt - datetime.now(timezone.utc)).total_seconds()
+        return max(0.0, wait)
+    except Exception:
+        return None
+
+
+def build_batch_user_content(batch_items):
+    payload = {
+        "items": [{"id": item["id"], "text": item["text"]} for item in batch_items]
+    }
+    return (
+        "请按要求润色以下段落批次。输入 JSON 如下：\n"
+        f"{json.dumps(payload, ensure_ascii=False)}\n\n"
+        "请严格按以下 JSON 返回，不要输出任何额外内容：\n"
+        "{\"items\":[{\"id\":0,\"need_edit\":true,\"revised_text\":\"...\"}]}\n"
+        "要求：\n"
+        "1) 返回中必须覆盖输入中的每个 id，且 id 不变。\n"
+        "2) 无需修改时 need_edit=false，并将原文放入 revised_text。\n"
+        "3) 只输出 JSON，不要输出 markdown 代码块或解释。"
+    )
+
+
+def call_openai_compatible_batch(session, client: ApiClient, batch_items):
     payload = {
         "model": client.model,
         "temperature": 0.2,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": paragraph_text},
+            {"role": "user", "content": build_batch_user_content(batch_items)},
         ],
     }
 
     last_error = None
     for attempt in range(client.retries + 1):
         try:
+            client.http_calls += 1
             resp = session.post(client.url, headers=client.headers, json=payload, timeout=client.timeout)
-            if resp.status_code >= 500 and attempt < client.retries:
-                time.sleep(client.retry_backoff * (2**attempt))
+            retryable_http = resp.status_code == 429 or resp.status_code >= 500
+            if retryable_http and attempt < client.retries:
+                wait = parse_retry_after(resp.headers.get("Retry-After"))
+                if wait is None:
+                    wait = client.retry_backoff * (2**attempt)
+                time.sleep(wait)
                 continue
-            resp.raise_for_status()
 
+            resp.raise_for_status()
             data = resp.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            parsed = try_parse_json(content)
-            if not parsed:
-                return False, paragraph_text, "json_parse_failed"
+            return try_parse_json(content)
 
-            revised = str(parsed.get("revised_text", "")).strip() or paragraph_text
-            need_edit = bool(parsed.get("need_edit", False))
-
-            if not need_edit or revised == paragraph_text:
-                return False, paragraph_text, "ok"
-            return True, revised, "ok"
-
+        except requests.HTTPError:
+            raise
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt < client.retries:
+                time.sleep(client.retry_backoff * (2**attempt))
+                continue
+            raise
         except Exception as exc:
             last_error = exc
             if attempt < client.retries:
                 time.sleep(client.retry_backoff * (2**attempt))
                 continue
-            raise last_error
+            raise
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("API 调用失败")
+
+
+def parse_item_id(raw_id, batch_size: int):
+    if isinstance(raw_id, bool):
+        return None
+    if isinstance(raw_id, int):
+        idx = raw_id
+    elif isinstance(raw_id, str) and raw_id.strip().lstrip("-").isdigit():
+        idx = int(raw_id.strip())
+    else:
+        return None
+    if 0 <= idx < batch_size:
+        return idx
+    return None
+
+
+def normalize_batch_results(batch_items, parsed):
+    results = {
+        item["id"]: {
+            "changed": False,
+            "revised_text": item["text"],
+            "status": "id_missing",
+        }
+        for item in batch_items
+    }
+
+    if not isinstance(parsed, dict):
+        for k in results:
+            results[k]["status"] = "json_parse_failed"
+        return results
+
+    items = parsed.get("items")
+    if not isinstance(items, list):
+        for k in results:
+            results[k]["status"] = "items_missing"
+        return results
+
+    seen = set()
+    for row in items:
+        if not isinstance(row, dict):
+            continue
+
+        idx = parse_item_id(row.get("id"), len(batch_items))
+        if idx is None or idx in seen:
+            continue
+        seen.add(idx)
+
+        old = batch_items[idx]["text"]
+        revised = str(row.get("revised_text", "")).strip()
+        need_edit = bool(row.get("need_edit", False))
+
+        if not revised:
+            results[idx] = {
+                "changed": False,
+                "revised_text": old,
+                "status": "empty_revised_text",
+            }
+            continue
+
+        if (not need_edit) or revised == old:
+            results[idx] = {
+                "changed": False,
+                "revised_text": old,
+                "status": "ok",
+            }
+            continue
+
+        results[idx] = {
+            "changed": True,
+            "revised_text": revised,
+            "status": "ok",
+        }
+
+    return results
 
 
 def print_analysis(doc: Document, chapter_indexes, ref, chapter_style_key):
@@ -236,6 +360,18 @@ def print_analysis(doc: Document, chapter_indexes, ref, chapter_style_key):
         title = doc.paragraphs[idx].text.strip()
         print(f"第{n}章标题段落[{idx}]: {title}")
     print(f"参考文献段落索引: {ref}")
+
+
+def write_fail_log(fail_fp, paragraph_index: int, status: str, error: str = ""):
+    if not fail_fp:
+        return
+    item = {
+        "paragraph_index": paragraph_index,
+        "status": status,
+    }
+    if error:
+        item["error"] = error
+    fail_fp.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
 def main():
@@ -261,11 +397,12 @@ def main():
         help="需要跳过的样式关键字，逗号分隔",
     )
 
+    parser.add_argument("--paragraphs-per-call", type=int, default=1, help="每次 API 调用处理的段落数")
     parser.add_argument("--min-len", type=int, default=6, help="最小段落长度")
     parser.add_argument("--timeout", type=int, default=180, help="单次API超时秒")
     parser.add_argument("--retries", type=int, default=2, help="API失败重试次数")
     parser.add_argument("--retry-backoff", type=float, default=1.5, help="重试退避基数秒")
-    parser.add_argument("--sleep", type=float, default=0.0, help="每次调用后休眠秒")
+    parser.add_argument("--sleep", type=float, default=0.0, help="每批次调用后休眠秒")
     parser.add_argument("--limit", type=int, default=0, help="调试：最多处理多少个候选段落")
     parser.add_argument("--fail-log", default="", help="保存失败段落日志(jsonl)")
     args = parser.parse_args()
@@ -274,11 +411,16 @@ def main():
         raise RuntimeError("缺少 --base-url（或环境变量 OPENAI_BASE_URL）")
     if not args.api_key:
         raise RuntimeError("缺少 --api-key（或环境变量 OPENAI_API_KEY）")
+    if args.paragraphs_per_call < 1:
+        raise RuntimeError("--paragraphs-per-call 必须 >= 1")
 
     skip_style_keys = [x.strip() for x in args.skip_style_keys.split(",") if x.strip()]
 
     in_path = Path(args.input)
     out_path = Path(args.output)
+
+    if not in_path.exists():
+        raise FileNotFoundError(f"输入文件不存在: {in_path}")
 
     try:
         doc = Document(str(in_path))
@@ -295,6 +437,32 @@ def main():
     print_analysis(doc, chapter_indexes, ref, args.chapter_style_key)
     print(f"处理范围: [{start}, {end})")
 
+    candidate_records = []
+    skipped = 0
+    for i in range(start, end):
+        paragraph = doc.paragraphs[i]
+        style = paragraph.style.name if paragraph.style is not None else ""
+        old = paragraph.text
+
+        if not is_target_paragraph(old, style, args.min_len, skip_style_keys):
+            skipped += 1
+            continue
+
+        candidate_records.append(
+            {
+                "paragraph_index": i,
+                "paragraph": paragraph,
+                "text": old,
+            }
+        )
+
+    if args.limit > 0:
+        candidate_records = candidate_records[: args.limit]
+
+    total = len(candidate_records)
+    batch_count = (total + args.paragraphs_per_call - 1) // args.paragraphs_per_call if total else 0
+    print(f"候选段落: {total}，每次 {args.paragraphs_per_call} 段，预计批次: {batch_count}")
+
     client = ApiClient(
         base_url=args.base_url,
         api_key=args.api_key,
@@ -305,7 +473,10 @@ def main():
     )
 
     session = requests.Session()
-    total = edited = skipped = api_err = 0
+    edited = 0
+    api_err = 0
+    fallback_err = 0
+    processed = 0
 
     fail_fp = None
     if args.fail_log:
@@ -314,40 +485,52 @@ def main():
         fail_fp = fail_path.open("w", encoding="utf-8")
 
     try:
-        for i in range(start, end):
-            p = doc.paragraphs[i]
-            style = p.style.name if p.style is not None else ""
-            old = p.text
-
-            if not is_target_paragraph(old, style, args.min_len, skip_style_keys):
-                skipped += 1
-                continue
-
-            total += 1
+        for offset in range(0, total, args.paragraphs_per_call):
+            batch_records = candidate_records[offset : offset + args.paragraphs_per_call]
+            batch_items = [
+                {"id": local_id, "text": record["text"]}
+                for local_id, record in enumerate(batch_records)
+            ]
 
             try:
-                changed, revised, _ = call_openai_compatible(session, client, old)
+                parsed = call_openai_compatible_batch(session, client, batch_items)
             except Exception as exc:
-                api_err += 1
-                item = {"paragraph_index": i, "error": f"{type(exc).__name__}: {exc}"}
-                if fail_fp:
-                    fail_fp.write(json.dumps(item, ensure_ascii=False) + "\n")
-                print(f"[API失败][{i}] {type(exc).__name__}: {exc}")
+                err = f"{type(exc).__name__}: {exc}"
+                for record in batch_records:
+                    api_err += 1
+                    write_fail_log(fail_fp, record["paragraph_index"], "api_error", err)
+                print(f"[API失败][batch {offset // args.paragraphs_per_call + 1}] {err}")
+                processed += len(batch_records)
+                if processed % 20 == 0 or processed == total:
+                    print(f"已处理: {processed}/{total}，已修改: {edited}，API失败: {api_err}，回退: {fallback_err}")
+                if args.sleep > 0 and processed < total:
+                    time.sleep(args.sleep)
                 continue
 
-            if changed:
-                write_diff(p, old, revised)
-                edited += 1
+            normalized = normalize_batch_results(batch_items, parsed)
+            for local_id, record in enumerate(batch_records):
+                result = normalized.get(local_id)
+                if not result:
+                    result = {
+                        "changed": False,
+                        "revised_text": record["text"],
+                        "status": "id_missing",
+                    }
 
-            if args.sleep > 0:
+                if result["changed"]:
+                    write_diff(record["paragraph"], record["text"], result["revised_text"])
+                    edited += 1
+
+                if result["status"] != "ok":
+                    fallback_err += 1
+                    write_fail_log(fail_fp, record["paragraph_index"], result["status"])
+
+            processed += len(batch_records)
+            if processed % 20 == 0 or processed == total:
+                print(f"已处理: {processed}/{total}，已修改: {edited}，API失败: {api_err}，回退: {fallback_err}")
+
+            if args.sleep > 0 and processed < total:
                 time.sleep(args.sleep)
-
-            if args.limit > 0 and total >= args.limit:
-                print("达到 --limit，提前结束")
-                break
-
-            if total % 20 == 0:
-                print(f"已处理: {total}，已修改: {edited}，API失败: {api_err}")
     finally:
         if fail_fp:
             fail_fp.close()
@@ -360,6 +543,8 @@ def main():
     print(f"实际修改: {edited}")
     print(f"跳过段落: {skipped}")
     print(f"API失败: {api_err}")
+    print(f"协议回退: {fallback_err}")
+    print(f"HTTP请求次数: {client.http_calls}")
     print(f"输出文件: {out_path}")
 
 

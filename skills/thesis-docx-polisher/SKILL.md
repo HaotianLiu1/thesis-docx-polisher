@@ -5,13 +5,18 @@ description: Polish and lightly revise academic thesis DOCX files via an OpenAI-
 
 # Thesis DOCX Polisher
 
-Use this skill to process thesis-like `.docx` files by calling an OpenAI-compatible API paragraph-by-paragraph, then writing a new `.docx` with visual diffs.
+Use this skill to process thesis-like `.docx` files by calling an OpenAI-compatible API in paragraph batches, then writing a new `.docx` with visual diffs.
 
 ## Workflow
 
-1. Confirm input file path and desired chapter range.
-2. Run `scripts/polish_docx_via_api.py` with API config.
-3. Verify output `.docx` exists and report statistics from script output.
+1. Confirm input and output file paths, plus API config (`base-url/api-key/model`).
+2. If the user did not specify any of these, ask follow-up questions before execution:
+   - start chapter (`--start-chapter`)
+   - end chapter (`--end-chapter`)
+   - paragraphs per API call (`--paragraphs-per-call`)
+3. For `--paragraphs-per-call`, suggest **3~8** by default, and warn that values too large may cause timeout, rate-limit amplification, or JSON parse fallback for an entire batch.
+4. Run `scripts/polish_docx_via_api.py`.
+5. Verify output `.docx` exists and report script stats (candidate/edited/errors/http_calls).
 
 ## Run command
 
@@ -24,6 +29,7 @@ python ".claude/skills/thesis-docx-polisher/scripts/polish_docx_via_api.py" \
   --model "<model-name>" \
   --start-chapter 1 \
   --end-chapter 5 \
+  --paragraphs-per-call 5 \
   --chapter-style-key "Heading 1" \
   --reference-title "参考文献"
 ```
@@ -31,8 +37,11 @@ python ".claude/skills/thesis-docx-polisher/scripts/polish_docx_via_api.py" \
 ## Parameter rules
 
 - `--start-chapter` and `--end-chapter` are based on first-level heading sequence.
-- You can customize heading detection with `--chapter-style-key` (default `Heading 1`).
 - `--end-chapter 0` means process from start chapter to the `--reference-title` text.
+- `--paragraphs-per-call` controls batch size per API request.
+  - `1` keeps legacy behavior (one paragraph per call).
+  - Recommended: `3~8` for lower request count with manageable response size.
+- You can customize heading detection with `--chapter-style-key` (default `Heading 1`).
 - Non-body paragraphs are skipped automatically by style keywords (`--skip-style-keys`).
 - Diff rendering:
   - inserted text: red font
@@ -44,8 +53,13 @@ python ".claude/skills/thesis-docx-polisher/scripts/polish_docx_via_api.py" \
 Use these when API endpoint is unstable:
 
 ```bash
---retries 2 --retry-backoff 1.5 --timeout 180 --fail-log "failures.jsonl"
+--retries 2 --retry-backoff 1.5 --timeout 180 --sleep 0.3 --fail-log "failures.jsonl"
 ```
+
+Notes:
+- Retries cover HTTP `429` and `5xx` plus request exceptions.
+- If response has `Retry-After`, script waits by that value first.
+- Fallback is paragraph-level: invalid/missing item id or empty `revised_text` keeps original text.
 
 ## Read references when needed
 

@@ -8,7 +8,9 @@ The script calls:
 - Header: `Authorization: Bearer <api_key>`
 - Header: `Content-Type: application/json`
 
-Payload shape:
+## Batch payload shape
+
+The script now sends paragraph batches in one request (size controlled by `--paragraphs-per-call`):
 
 ```json
 {
@@ -16,23 +18,48 @@ Payload shape:
   "temperature": 0.2,
   "messages": [
     {"role": "system", "content": "..."},
-    {"role": "user", "content": "<paragraph_text>"}
+    {
+      "role": "user",
+      "content": "... {\"items\":[{\"id\":0,\"text\":\"段落A\"},{\"id\":1,\"text\":\"段落B\"}]} ..."
+    }
   ]
 }
 ```
 
+Notes:
+- `id` is the local index within the current batch (`0..batch_size-1`).
+- `--paragraphs-per-call 1` preserves legacy one-paragraph-per-request behavior.
+
 ## Required model response format
 
-The script expects JSON (or fenced JSON) in this format:
+Model must return JSON in this contract:
 
 ```json
-{"need_edit": true, "revised_text": "..."}
+{
+  "items": [
+    {"id": 0, "need_edit": true, "revised_text": "..."},
+    {"id": 1, "need_edit": false, "revised_text": "..."}
+  ]
+}
 ```
 
 Rules:
+- Each returned item maps back by `id`, not by order.
+- If `need_edit=false` or `revised_text` equals original, paragraph remains unchanged.
 
-- If `need_edit=false` and `revised_text` unchanged, paragraph remains unchanged.
-- If parser cannot extract valid JSON, paragraph is treated as unchanged.
+## Fallback / fault tolerance policy
+
+- Whole-response parse failure (`non-JSON`): all paragraphs in that batch fallback to original text.
+- Missing/invalid `id`: only that paragraph falls back.
+- Empty `revised_text`: only that paragraph falls back.
+- Fallback events are written to `--fail-log` with `status`.
+
+## Retry / rate limit behavior
+
+- Retries include request exceptions, HTTP `429`, and HTTP `5xx`.
+- Backoff: `retry_backoff * 2^attempt`.
+- If response has `Retry-After`, it is used as wait time before exponential fallback.
+- `--sleep` applies between batches for lightweight client-side throttling.
 
 ## Prompt intent
 

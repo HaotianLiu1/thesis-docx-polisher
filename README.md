@@ -87,7 +87,7 @@ $env:OPENAI_MODEL="<model-name>"
 #### 方式 A：自然语言触发技能（推荐）
 在 Claude Code 里直接说：
 
-- “请用 thesis-docx-polisher 对 `xxx.docx` 做第一到第五章润色，输出 `xxx_润色.docx`，用我当前配置的 API。”
+- “请用 thesis-docx-polisher 对 `xxx.docx` 做第一到第五章润色，每次调用api的段落数为x，输出 `xxx_润色.docx`，用我当前配置的 API。”
 
 并且：
 - 若你没有明确给出 `start-chapter / end-chapter / paragraphs-per-call`，技能会先反问你这 3 个参数，再执行。

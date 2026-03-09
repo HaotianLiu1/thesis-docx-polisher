@@ -7,7 +7,7 @@
 ## 中文（如何作为 Claude Code 技能使用）
 
 ### 这是什么
-这是一个可直接放入 **Claude Code skills 目录** 的技能（不是单纯脚本集合）。
+这是一个可直接放入 **Claude Code skills 目录** 的技能。
 
 - 技能名：`thesis-docx-polisher`
 - 核心能力：对论文 `.docx` 逐段调用 OpenAI 兼容 API 进行轻量润色，并在输出文档中做差异标注：
@@ -34,12 +34,12 @@ skills/
 
 ---
 
-### 1）如何导入到别人的 Claude Code
+### 1）如何导入到 Claude Code
 
-将本仓库里的 `skills/thesis-docx-polisher` 目录复制到对方项目中：
+将本仓库里的 `skills/thesis-docx-polisher` 目录复制到项目中：
 
 ```text
-<对方项目根目录>/.claude/skills/thesis-docx-polisher
+<项目根目录>/.claude/skills/thesis-docx-polisher
 ```
 
 也就是最终路径应为：
@@ -126,6 +126,7 @@ python ".claude/skills/thesis-docx-polisher/scripts/polish_docx_via_api.py" \
 ### 6）给使用者的建议（降AI但不过度改写）
 
 - 模型提示已约束为“微调优先，不改变原意”。
+- 提示词针对不同模型效果差异大，建议针对论文类型和模型调整skills中的提示词。
 - 建议先小范围试跑（`--limit`）确认风格后再全量。
 - 若接口不稳定，开启重试与失败日志后补跑失败段落。
 
